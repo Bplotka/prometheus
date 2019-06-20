@@ -197,6 +197,7 @@ type Options struct {
 	PageTitle                  string
 	RemoteReadSampleLimit      int
 	RemoteReadConcurrencyLimit int
+	RemoteReadMaxChunksInFrame int
 }
 
 func instrumentHandlerWithPrefix(prefix string) func(handlerName string, handler http.HandlerFunc) http.HandlerFunc {
@@ -270,6 +271,7 @@ func New(logger log.Logger, o *Options) *Handler {
 		h.ruleManager,
 		h.options.RemoteReadSampleLimit,
 		h.options.RemoteReadConcurrencyLimit,
+		h.options.RemoteReadMaxChunksInFrame,
 		h.options.CORSOrigin,
 	)
 
