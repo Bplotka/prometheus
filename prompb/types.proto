@@ -56,3 +56,21 @@ message ReadHints {
   int64 start_ms = 3; // Start time in milliseconds.
   int64 end_ms = 4;   // End time in milliseconds.
 }
+
+message Chunk {
+  int64 min_time_ms = 1;
+  int64 max_time_ms = 2;
+
+  // Has to match chunkenc.Encoding.
+  enum Encoding {
+    UNKNOWN = 0;
+    XOR     = 1;
+  }
+  Encoding type  = 3;
+  bytes data     = 4;
+}
+
+message ChunkedSeries {
+  repeated Label labels = 1 [(gogoproto.nullable) = false];
+  repeated Chunk chunks = 2 [(gogoproto.nullable) = false];
+}

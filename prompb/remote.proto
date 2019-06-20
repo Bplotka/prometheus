@@ -25,8 +25,15 @@ message WriteRequest {
 
 message ReadRequest {
   repeated Query queries = 1;
+
+  enum ResponseType {
+    SAMPLES = 0;
+    STREAMED_XOR_CHUNKS = 1;
+  }
+  ResponseType response_type = 2;
 }
 
+// ReadResponse is a response when response_type equals RAW
 message ReadResponse {
   // In same order as the request's queries.
   repeated QueryResult results = 1;
@@ -42,4 +49,14 @@ message Query {
 message QueryResult {
   // Samples within a time series must be ordered by time.
   repeated prometheus.TimeSeries timeseries = 1;
+}
+
+// ChunkedReadResponse is a response when response_type equals STREAMED_XOR_CHUNKS.
+// It is a single frame delimited by X.
+// We strictly stream full series by series. Single frame can contain part of the single series.
+message ChunkedReadResponse {
+  repeated prometheus.ChunkedSeries chunked_series = 1;
+
+  // This is used when we have more than one ReadRequest.queries.
+  int64 query_index = 2;
 }
