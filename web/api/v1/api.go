@@ -838,7 +838,8 @@ func (api *API) serveFlags(r *http.Request) apiFuncResult {
 }
 
 func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
-	if err := api.remoteReadGate.Start(r.Context()); err != nil {
+	ctx := r.Context()
+	if err := api.remoteReadGate.Start(ctx); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -853,11 +854,18 @@ func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.ResponseType != prompb.ReadRequest_SAMPLES {
+	switch req.ResponseType {
+	case prompb.ReadRequest_SAMPLES: // Also default.
+	 	api.sampledRemoteRead(ctx, w, req)
+	case prompb.ReadRequest_STREAMED_XOR_CHUNKS:
+		api.streamedChunkedRemoteRead(ctx, w, req)
+	default:
 		http.Error(w, fmt.Sprintf("%s response type is not implemented", req.ResponseType.String()), http.StatusNotImplemented)
 		return
 	}
+}
 
+func (api *API) sampledRemoteRead(ctx context.Context, w http.ResponseWriter, req *prompb.ReadRequest) {
 	resp := prompb.ReadResponse{
 		Results: make([]*prompb.QueryResult, len(req.Queries)),
 	}
@@ -868,12 +876,16 @@ func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		querier, err := api.Queryable.Querier(r.Context(), from, through)
+		querier, err := api.Queryable.Querier(ctx, from, through)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		defer querier.Close()
+		defer func() {
+			if err :=querier.Close(); err != nil {
+				level.Warn(api.logger).Log("msg", "error on querier close", "err", err.Error())
+			}
+		}()
 
 		// Change equality matchers which match external labels
 		// to a matcher that looks for an empty label,
@@ -922,13 +934,91 @@ func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
 		})
 
 		for _, ts := range resp.Results[i].Timeseries {
-			ts.Labels = mergeLabels(ts.Labels, sortedExternalLabels)
+			ts.Labels = remote.MergeLabels(ts.Labels, sortedExternalLabels)
 		}
 	}
 
 	if err := remote.EncodeReadResponse(&resp, w); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+}
+
+func (api *API) streamedChunkedRemoteRead(ctx context.Context, w http.ResponseWriter, req *prompb.ReadRequest) {
+	for i, query := range req.Queries {
+		from, through, matchers, selectParams, err := remote.FromQuery(query)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		querier, err := api.Queryable.Querier(ctx, from, through)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer func() {
+			if err :=querier.Close(); err != nil {
+				level.Warn(api.logger).Log("msg", "error on querier close", "err", err.Error())
+			}
+		}()
+
+		// Change equality matchers which match external labels
+		// to a matcher that looks for an empty label,
+		// as that label should not be present in the storage.
+		externalLabels := api.config().GlobalConfig.ExternalLabels.Map()
+		filteredMatchers := make([]*labels.Matcher, 0, len(matchers))
+		for _, m := range matchers {
+			value := externalLabels[m.Name]
+			if m.Type == labels.MatchEqual && value == m.Value {
+				matcher, err := labels.NewMatcher(labels.MatchEqual, m.Name, "")
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				filteredMatchers = append(filteredMatchers, matcher)
+			} else {
+				filteredMatchers = append(filteredMatchers, m)
+			}
+		}
+
+		// TODO(bwplotka): Change interface / find a way to select chunks.
+		set, _, err := querier.Select(selectParams, filteredMatchers...)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Add external labels back in, in sorted order.
+		sortedExternalLabels := make([]prompb.Label, 0, len(externalLabels))
+		for name, value := range externalLabels {
+			sortedExternalLabels = append(sortedExternalLabels, prompb.Label{
+				Name:  string(name),
+				Value: string(value),
+			})
+		}
+		sort.Slice(sortedExternalLabels, func(i, j int) bool {
+			return sortedExternalLabels[i].Name < sortedExternalLabels[j].Name
+		})
+
+		w.Header().Set("Content-Type", "application/x-streamed-protobuf; proto=prometheus.ChunkedReadResponse")
+		// TODO(bwplotka): Should we use snappy? benchmark to see.
+		// w.Header().Set("Content-Encoding", "snappy")
+
+		if err := remote.StreamChunkedReadResponses(
+			remote.NewStreamWriter(w),
+			int64(i),
+			set,
+			sortedExternalLabels,
+			api.remoteReadSampleLimit,
+		); err != nil {
+			if httpErr, ok := err.(remote.HTTPError); ok {
+				http.Error(w, httpErr.Error(), httpErr.Status())
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 }
 
@@ -1067,33 +1157,6 @@ func convertMatcher(m *labels.Matcher) tsdbLabels.Matcher {
 		return tsdbLabels.Not(res)
 	}
 	panic("storage.convertMatcher: invalid matcher type")
-}
-
-// mergeLabels merges two sets of sorted proto labels, preferring those in
-// primary to those in secondary when there is an overlap.
-func mergeLabels(primary, secondary []prompb.Label) []prompb.Label {
-	result := make([]prompb.Label, 0, len(primary)+len(secondary))
-	i, j := 0, 0
-	for i < len(primary) && j < len(secondary) {
-		if primary[i].Name < secondary[j].Name {
-			result = append(result, primary[i])
-			i++
-		} else if primary[i].Name > secondary[j].Name {
-			result = append(result, secondary[j])
-			j++
-		} else {
-			result = append(result, primary[i])
-			i++
-			j++
-		}
-	}
-	for ; i < len(primary); i++ {
-		result = append(result, primary[i])
-	}
-	for ; j < len(secondary); j++ {
-		result = append(result, secondary[j])
-	}
-	return result
 }
 
 func (api *API) respond(w http.ResponseWriter, data interface{}, warnings storage.Warnings) {

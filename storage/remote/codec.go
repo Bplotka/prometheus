@@ -15,15 +15,15 @@ package remote
 
 import (
 	"fmt"
-	"io"
-	"io/ioutil"
-	"net/http"
-	"sort"
-
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/tsdb/chunkenc"
+	"io"
+	"io/ioutil"
+	"net/http"
+	"sort"
 
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/prompb"
@@ -181,6 +181,148 @@ func FromQueryResult(res *prompb.QueryResult) storage.SeriesSet {
 	return &concreteSeriesSet{
 		series: series,
 	}
+}
+
+func StreamChunkedReadResponses(
+	stream io.Writer,
+	queryIndex int64,
+	ss storage.SeriesSet,
+	sortedExternalLabels []prompb.Label,
+	sampleLimit int) error {
+	var numSamples = 0
+
+	for ss.Next() {
+		series := ss.At()
+		iter := series.Iterator()
+		lbls := MergeLabels(labelsToLabelsProto(series.Labels()), sortedExternalLabels)
+
+		for iter.Next() {
+			// TODO(bwplotka): Expose maxChunks as flag?
+			chks, samples, err := encodeChunks(iter, 120, 100, sampleLimit-numSamples)
+			if err != nil {
+				return err
+			}
+			numSamples += samples
+			if len(chks) == 0 {
+				break
+			}
+
+			b, err := proto.Marshal(&prompb.ChunkedReadResponse{
+				// TODO(bwplotka): Do we really need multiple?
+				ChunkedSeries: []*prompb.ChunkedSeries{
+					{
+						// TODO(bwplotka): Oneof? We don't need to send labels all the time.
+						Labels: lbls,
+						Chunks: chks,
+					},
+				},
+				QueryIndex: queryIndex,
+			})
+			if err != nil {
+				return errors.Wrap(err, "marshal ChunkedReadResponse")
+			}
+
+			if _, err := stream.Write(b); err != nil {
+				return errors.Wrap(err, "write to stream")
+			}
+		}
+
+		if err := iter.Err(); err != nil {
+			return err
+		}
+	}
+	if err := ss.Err(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// encodeChunks expects iterator to be ready to use (aka iter.Next() done before invoking).
+func encodeChunks(iter storage.SeriesIterator, maxSamplesPerChunk int, maxChunks int, sampleLimit int) ([]prompb.Chunk, int, error) {
+	var (
+		chkMint int64
+		chk     *chunkenc.XORChunk
+		app     chunkenc.Appender
+		err     error
+
+		isNext     = true
+		numSamples = 0
+		chks       = make([]prompb.Chunk, 0, maxChunks)
+	)
+
+	for isNext {
+		numSamples++
+		if sampleLimit > 0 && numSamples > sampleLimit {
+			return nil, numSamples, HTTPError{
+				msg:    fmt.Sprintf("exceeded sample limit (%d)", sampleLimit),
+				status: http.StatusBadRequest,
+			}
+		}
+
+		if chk == nil {
+			chk = chunkenc.NewXORChunk()
+			app, err = chk.Appender()
+			if err != nil {
+				return nil, numSamples, err
+			}
+			chkMint, _ = iter.At()
+		}
+
+		app.Append(iter.At())
+		chkMaxt, _ := iter.At()
+
+		isNext = iter.Next()
+		if isNext && chk.NumSamples() < maxSamplesPerChunk {
+			continue
+		}
+
+		// Cut the chunk.
+		chks = append(chks, prompb.Chunk{
+			MinTimeMs: chkMint,
+			MaxTimeMs: chkMaxt,
+			Type:      prompb.Chunk_Encoding(chk.Encoding()),
+			Data:      chk.Bytes(),
+		})
+		chk = nil
+
+		if maxChunks >= len(chks) {
+			break
+		}
+	}
+	if iter.Err() != nil {
+		return nil, numSamples, errors.Wrap(iter.Err(), "iter TSDB series")
+	}
+
+	return chks, numSamples, nil
+
+}
+
+// MergeLabels merges two sets of sorted proto labels, preferring those in
+// primary to those in secondary when there is an overlap.
+func MergeLabels(primary, secondary []prompb.Label) []prompb.Label {
+	result := make([]prompb.Label, 0, len(primary)+len(secondary))
+	i, j := 0, 0
+	for i < len(primary) && j < len(secondary) {
+		if primary[i].Name < secondary[j].Name {
+			result = append(result, primary[i])
+			i++
+		} else if primary[i].Name > secondary[j].Name {
+			result = append(result, secondary[j])
+			j++
+		} else {
+			result = append(result, primary[i])
+			i++
+			j++
+		}
+	}
+	for ; i < len(primary); i++ {
+		result = append(result, primary[i])
+	}
+	for ; j < len(secondary); j++ {
+		result = append(result, secondary[j])
+	}
+	return result
 }
 
 type byLabel []storage.Series
