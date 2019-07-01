@@ -842,7 +842,9 @@ func (api *API) serveFlags(r *http.Request) apiFuncResult {
 
 // negotiateResponseType returns response type that this server supports if it's part of accepted list.
 func negotiateResponseType(accepted []prompb.ReadRequest_ResponseType) prompb.ReadRequest_ResponseType {
-	supported := map[prompb.ReadRequest_ResponseType]struct{}{}
+	supported := map[prompb.ReadRequest_ResponseType]struct{}{
+		prompb.ReadRequest_STREAMED_XOR_CHUNKS: {},
+	}
 	for _, resType := range accepted {
 		if _, ok := supported[resType]; ok {
 			return resType
@@ -871,6 +873,7 @@ func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
 	// Empty req.AcceptedResponseTypes means non streamed, raw samples response.
 	if len(req.AcceptedResponseTypes) == 0 {
 		api.sampledRemoteRead(ctx, w, req)
+		return
 	}
 
 	switch negotiateResponseType(req.AcceptedResponseTypes) {
@@ -878,7 +881,6 @@ func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
 		api.streamedChunkedRemoteRead(ctx, w, req)
 	default:
 		http.Error(w, fmt.Sprintf("none of requested response types are implemented: %v", req.AcceptedResponseTypes), http.StatusNotImplemented)
-		return
 	}
 }
 
@@ -1018,6 +1020,7 @@ func (api *API) streamedChunkedRemoteRead(ctx context.Context, w http.ResponseWr
 			return sortedExternalLabels[i].Name < sortedExternalLabels[j].Name
 		})
 
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Content-Type", "application/x-streamed-protobuf; proto=prometheus.ChunkedReadResponse")
 		// TODO(bwplotka): Should we use snappy? benchmark to see.
 		// w.Header().Set("Content-Encoding", "snappy")

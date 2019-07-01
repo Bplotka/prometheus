@@ -197,6 +197,7 @@ func NewQueueManager(logger log.Logger, walDir string, samplesIn *ewmaRate, cfg 
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
+	log.With()
 
 	name := client.Name()
 	logger = log.With(logger, "queue", name)

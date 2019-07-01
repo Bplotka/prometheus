@@ -22,12 +22,14 @@ import (
 	"io"
 	"io/ioutil"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1050,37 +1052,56 @@ func TestStreamReadEndpoint(t *testing.T) {
 	testutil.Ok(t, err)
 
 	compressed := snappy.Encode(nil, data)
-	request, err := http.NewRequest("POST", "", bytes.NewBuffer(compressed))
+
+	l, err := net.Listen("tcp", "localhost:0")
 	testutil.Ok(t, err)
 
-	recorder := httptest.NewRecorder()
-	api.remoteRead(recorder, request)
+	// DEBUG: Trying real http request to test chunk format.
+	w := sync.WaitGroup{}
+	w.Add(1)
+	go func() {
+		_ = http.Serve(l, http.HandlerFunc(api.remoteRead))
+		w.Done()
+	}()
+	defer func() {
+		_= l.Close()
+		w.Wait()
+	}()
 
-	if recorder.Code/100 != 2 {
-		t.Fatal(recorder.Code)
+	request, err := http.NewRequest("POST", "http://" + l.Addr().String(), bytes.NewBuffer(compressed))
+	testutil.Ok(t, err)
+
+	response, err := (&http.Client{}).Do(request)
+	testutil.Ok(t,err)
+
+	if response.StatusCode/100 != 2 {
+		all, err := ioutil.ReadAll(response.Body)
+		testutil.Ok(t, err)
+
+		fmt.Println(string(all))
+		t.Fatal(response.StatusCode)
 	}
 
-	testutil.Equals(t, "application/x-streamed-protobuf; proto=prometheus.ChunkedReadResponse", recorder.Result().Header.Get("Content-Type"))
-	testutil.Equals(t, "", recorder.Result().Header.Get("Content-Encoding"))
+	testutil.Equals(t, "application/x-streamed-protobuf; proto=prometheus.ChunkedReadResponse", response.Header.Get("Content-Type"))
+	testutil.Equals(t, "", response.Header.Get("Content-Encoding"))
 
 	var results []*prompb.ChunkedReadResponse
-	stream := remote.NewStreamReader(recorder.Result().Body)
+
+	stream := remote.NewProtoChunkedReader(response.Body)
 	for {
-		b, err := stream.Next()
+		res := &prompb.ChunkedReadResponse{}
+		err := stream.NextProto(res)
 		if err == io.EOF {
 			break
 		}
 		testutil.Ok(t, err)
 
-		res := &prompb.ChunkedReadResponse{}
-		err = proto.Unmarshal(b, res)
-		testutil.Ok(t, err)
-
+		fmt.Println(res.String())
 		results = append(results, res)
 	}
 
 	if len(results) != 3 {
-		t.Fatalf("Expected 1 result, got %d", len(results))
+		t.Fatalf("Expected 3 result, got %d", len(results))
 	}
 
 	testutil.Equals(t, []*prompb.ChunkedReadResponse{

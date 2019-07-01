@@ -225,9 +225,11 @@ func StreamChunkedReadResponses(
 				return errors.Wrap(err, "marshal ChunkedReadResponse")
 			}
 
+			fmt.Println("initial write ", len(b))
 			if _, err := w.Write(b); err != nil {
 				return errors.Wrap(err, "write to stream")
 			}
+			fmt.Println("flush")
 			f.Flush()
 		}
 
@@ -239,6 +241,7 @@ func StreamChunkedReadResponses(
 		return err
 	}
 
+	f.Flush()
 	return nil
 }
 
@@ -299,8 +302,41 @@ func encodeChunks(iter storage.SeriesIterator, maxSamplesPerChunk int, maxChunks
 	}
 
 	return chks, numSamples, nil
-
 }
+
+type ProtoChunkedReader struct {
+	b    io.Reader
+	data []byte
+}
+
+// TODO(bwplotka): This is bad as we might outgrow the message size easily.
+const maxLineLength = 4096 // assumed <= bufio.defaultBufSize
+
+// NewProtoChunkedReader constructs a ProtoChunkedReader.
+func NewProtoChunkedReader(r io.Reader) *ProtoChunkedReader {
+	return &ProtoChunkedReader{b: r, data: make([]byte, maxLineLength)}
+}
+
+func (r *ProtoChunkedReader) next() ([]byte, error) {
+	n, err := r.b.Read(r.data)
+	if err != nil {
+		fmt.Println("n", n, "er", err)
+		return nil, err
+	}
+	fmt.Println("n", n)
+	return r.data[:n], nil
+}
+
+// NextProto consumes the next available record by calling r.Next, and decodes
+// it into the protobuf with proto.Unmarshal.
+func (r *ProtoChunkedReader) NextProto(pb proto.Message) error {
+	rec, err := r.next()
+	if err != nil {
+		return err
+	}
+	return proto.Unmarshal(rec, pb)
+}
+
 
 // MergeLabels merges two sets of sorted proto labels, preferring those in
 // primary to those in secondary when there is an overlap.
